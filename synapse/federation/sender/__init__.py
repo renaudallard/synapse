@@ -170,7 +170,13 @@ from synapse.metrics.background_process_metrics import (
     run_as_background_process,
     wrap_as_background_process,
 )
-from synapse.types import JsonDict, ReadReceipt, RoomStreamToken, StrCollection
+from synapse.types import (
+    JsonDict,
+    ReadReceipt,
+    RoomStreamToken,
+    StrCollection,
+    get_domain_from_id,
+)
 from synapse.util import Clock
 from synapse.util.metrics import Measure
 from synapse.util.retryutils import filter_destinations_by_retry_limiter
@@ -297,12 +303,10 @@ class _DestinationWakeupQueue:
     # being woken up.
     _MAX_TIME_IN_QUEUE = 30.0
 
-    # The maximum duration in seconds between waking up consecutive destination
-    # queues.
-    _MAX_DELAY = 0.1
-
     sender: "FederationSender" = attr.ib()
     clock: Clock = attr.ib()
+    max_delay_s: int = attr.ib()
+
     queue: "OrderedDict[str, Literal[None]]" = attr.ib(factory=OrderedDict)
     processing: bool = attr.ib(default=False)
 
@@ -332,7 +336,7 @@ class _DestinationWakeupQueue:
             # We also add an upper bound to the delay, to gracefully handle the
             # case where the queue only has a few entries in it.
             current_sleep_seconds = min(
-                self._MAX_DELAY, self._MAX_TIME_IN_QUEUE / len(self.queue)
+                self.max_delay_s, self._MAX_TIME_IN_QUEUE / len(self.queue)
             )
 
             while self.queue:
@@ -422,13 +426,14 @@ class FederationSender(AbstractFederationSender):
         # and that there is a pending call to _flush_rrs_for_room in the system.
         self._queues_awaiting_rr_flush_by_room: Dict[str, Set[PerDestinationQueue]] = {}
 
-        self._rr_txn_interval_per_room_ms = (
-            1000.0
-            / hs.config.ratelimiting.federation_rr_transactions_per_room_per_second
+        rr_txn_interval_per_room_s = (
+            1.0 / hs.config.ratelimiting.federation_rr_transactions_per_room_per_second
         )
 
         self._external_cache = hs.get_external_cache()
-        self._destination_wakeup_queue = _DestinationWakeupQueue(self, self.clock)
+        self._destination_wakeup_queue = _DestinationWakeupQueue(
+            self, self.clock, max_delay_s=rr_txn_interval_per_room_s
+        )
 
         # Regularly wake up destinations that have outstanding PDUs to be caught up
         self.clock.looping_call_now(
@@ -776,6 +781,9 @@ class FederationSender(AbstractFederationSender):
 
         room_id = receipt.room_id
 
+        # Local read receipts always have 1 event ID.
+        event_id = receipt.event_ids[0]
+
         # Work out which remote servers should be poked and poke them.
         domains_set = await self._storage_controllers.state.get_current_hosts_in_room_or_partial_state_approximation(
             room_id
@@ -797,49 +805,51 @@ class FederationSender(AbstractFederationSender):
         if not domains:
             return
 
-        queues_pending_flush = self._queues_awaiting_rr_flush_by_room.get(room_id)
+        # We now split which domains we want to wake up immediately vs which we
+        # want to delay waking up.
+        immediate_domains: StrCollection
+        delay_domains: StrCollection
 
-        # if there is no flush yet scheduled, we will send out these receipts with
-        # immediate flushes, and schedule the next flush for this room.
-        if queues_pending_flush is not None:
-            logger.debug("Queuing receipt for: %r", domains)
+        if len(domains) < 10:
+            # For "small" rooms send to all domains immediately
+            immediate_domains = domains
+            delay_domains = ()
         else:
-            logger.debug("Sending receipt to: %r", domains)
-            self._schedule_rr_flush_for_room(room_id, len(domains))
+            metadata = await self.store.get_metadata_for_event(
+                receipt.room_id, event_id
+            )
+            assert metadata is not None
 
-        for domain in domains:
+            sender_domain = get_domain_from_id(metadata.sender)
+
+            if self.clock.time_msec() - metadata.received_ts < 60_000:
+                # We always send receipts for recent messages immediately
+                immediate_domains = domains
+                delay_domains = ()
+            else:
+                # Otherwise, we delay waking up all destinations except for the
+                # sender's domain.
+                immediate_domains = []
+                delay_domains = []
+                for domain in domains:
+                    if domain == sender_domain:
+                        immediate_domains.append(domain)
+                    else:
+                        delay_domains.append(domain)
+
+        for domain in immediate_domains:
+            # Add to destination queue and wake the destination up
+            queue = self._get_per_destination_queue(domain)
+            queue.queue_read_receipt(receipt)
+            queue.flush_read_receipts_for_room(room_id)
+
+        for domain in delay_domains:
+            # Add to destination queue...
             queue = self._get_per_destination_queue(domain)
             queue.queue_read_receipt(receipt)
 
-            # if there is already a RR flush pending for this room, then make sure this
-            # destination is registered for the flush
-            if queues_pending_flush is not None:
-                queues_pending_flush.add(queue)
-            else:
-                queue.flush_read_receipts_for_room(room_id)
-
-    def _schedule_rr_flush_for_room(self, room_id: str, n_domains: int) -> None:
-        # that is going to cause approximately len(domains) transactions, so now back
-        # off for that multiplied by RR_TXN_INTERVAL_PER_ROOM
-        backoff_ms = self._rr_txn_interval_per_room_ms * n_domains
-
-        logger.debug("Scheduling RR flush in %s in %d ms", room_id, backoff_ms)
-        self.clock.call_later(backoff_ms, self._flush_rrs_for_room, room_id)
-        self._queues_awaiting_rr_flush_by_room[room_id] = set()
-
-    def _flush_rrs_for_room(self, room_id: str) -> None:
-        queues = self._queues_awaiting_rr_flush_by_room.pop(room_id)
-        logger.debug("Flushing RRs in %s to %s", room_id, queues)
-
-        if not queues:
-            # no more RRs arrived for this room; we are done.
-            return
-
-        # schedule the next flush
-        self._schedule_rr_flush_for_room(room_id, len(queues))
-
-        for queue in queues:
-            queue.flush_read_receipts_for_room(room_id)
+            # ... and schedule the destination to be woken up.
+            self._destination_wakeup_queue.add_to_queue(domain)
 
     async def send_presence_to_destinations(
         self, states: Iterable[UserPresenceState], destinations: Iterable[str]
