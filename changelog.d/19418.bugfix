@@ -1,0 +1,1 @@
+Fix a typo to run synapse without setuptools_rust
